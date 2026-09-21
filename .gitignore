@@ -1,0 +1,30 @@
+# Firebase service account key (contains sensitive credentials)
+serviceAccountKey.json
+
+# Firebase configuration (contains sensitive keys)
+firebase-config.json
+
+# Environment variables
+.env
+.env.local
+
+# Node modules (if you add a build system later)
+node_modules/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build outputs
+dist/
+build/
