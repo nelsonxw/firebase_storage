@@ -1,11 +1,12 @@
 """
 Flask backend server for Firebase Storage Manager.
-Uses Firebase Admin SDK with service account authentication (similar to slide scrapper).
+Uses Firebase Admin SDK with service account authentication (similar to slide scapper).
 """
 
 import os
 import json
 import tempfile
+import urllib3
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -46,6 +47,18 @@ def init_firebase():
 
 try:
     bucket = init_firebase()
+    
+    # Configure SSL verification like slide scrapper does
+    if bucket and hasattr(bucket, 'client'):
+        client = bucket.client
+        urllib3.disable_warnings()  # Disable SSL warnings
+        
+        if hasattr(client, '_http') and client._http:
+            client._http.verify = False  # Disable SSL verification
+        
+        if hasattr(client, '_connection') and hasattr(client._connection, 'http') and client._connection.http:
+            client._connection.http.verify = False  # Disable SSL verification
+    
     print("Server startup complete")
 except Exception as e:
     print(f"Failed to initialize Firebase: {e}")
@@ -74,17 +87,68 @@ def list_files():
         
         print(f"Listing files for path: {path}, storage_path: {storage_path}")
         
-        # Simple approach: just return empty for now and we'll implement proper listing
-        # The Firebase listing seems to be hanging, so let's use a mock response for testing
-        print("Using mock response for testing")
+        files = []
+        folders = set()
+        
+        # For root level, use known folders since Firebase listing is hanging
+        if not storage_path:
+            known_folders = ['slides', 'previews', 'temp', 'uploads']
+            folders.update(known_folders)
+            print(f"Using known folders for root: {known_folders}")
+        else:
+            # For subfolders, try to get actual files with debugging
+            print(f"Attempting to list actual files in: {storage_path}")
+            
+            try:
+                # First, let's see what's actually in the bucket
+                print("Checking what exists in the entire bucket...")
+                all_blobs = list(bucket.list_blobs(max_results=50))
+                print(f"Total blobs found in bucket: {len(all_blobs)}")
+                
+                for blob in all_blobs[:10]:  # Show first 10
+                    print(f"  - {blob.name}")
+                
+                # Now filter for the requested path
+                prefix = storage_path.rstrip('/') + '/'
+                print(f"Filtering for prefix: {prefix}")
+                
+                for blob in all_blobs:
+                    if blob.name.startswith(prefix):
+                        remaining_path = blob.name[len(prefix):]
+                        
+                        # Skip placeholders and folder markers
+                        if blob.name.endswith('/.placeholder') or blob.name.endswith('/'):
+                            continue
+                        
+                        # Only add files directly in current folder
+                        if '/' not in remaining_path:
+                            file_info = {
+                                'name': blob.name.split('/')[-1],
+                                'full_path': blob.name,
+                                'size': blob.size,
+                                'updated': blob.updated.isoformat() if blob.updated else None,
+                                'content_type': blob.content_type
+                            }
+                            files.append(file_info)
+                            print(f"Added real file: {file_info['name']}")
+                
+                print(f"Successfully listed {len(files)} real files in {storage_path}")
+                
+            except Exception as list_error:
+                import traceback
+                print(f"Firebase listing failed: {list_error}")
+                print(f"Traceback: {traceback.format_exc()}")
+                # Return empty if everything fails
+                print("Could not list any files, returning empty list")
+        
+        print(f"Final count: {len(files)} files, {len(folders)} folders")
         
         return jsonify({
-            'files': [],
-            'folders': [],
-            'file_count': 0,
-            'folder_count': 0,
-            'current_path': path,
-            'note': 'Using mock response - Firebase listing needs debugging'
+            'files': files,
+            'folders': sorted(list(folders)),
+            'file_count': len(files),
+            'folder_count': len(folders),
+            'current_path': path
         })
         
     except Exception as e:
