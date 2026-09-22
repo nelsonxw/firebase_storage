@@ -19,7 +19,7 @@ CORS(app)  # Enable CORS for frontend
 
 # Configuration
 SERVICE_ACCOUNT_PATH = Path(__file__).parent / "serviceAccountKey.json"
-STORAGE_BUCKET = "slide-preview.appspot.com"
+STORAGE_BUCKET = "slide-preview.firebasestorage.app"
 
 # Initialize Firebase Admin
 def init_firebase():
@@ -90,63 +90,80 @@ def list_files():
         files = []
         folders = set()
         
-        # For root level, use known folders since Firebase listing is hanging
-        if not storage_path:
-            known_folders = ['slides', 'previews', 'temp', 'uploads']
-            folders.update(known_folders)
-            print(f"Using known folders for root: {known_folders}")
+        # Set the prefix for listing
+        if storage_path:
+            prefix = storage_path.rstrip('/') + '/'
         else:
-            # For subfolders, try to get actual files with debugging
-            print(f"Attempting to list actual files in: {storage_path}")
-            
-            try:
-                # First, let's see what's actually in the bucket
-                print("Checking what exists in the entire bucket...")
-                all_blobs = list(bucket.list_blobs(max_results=50))
-                print(f"Total blobs found in bucket: {len(all_blobs)}")
-                
-                for blob in all_blobs[:10]:  # Show first 10
-                    print(f"  - {blob.name}")
-                
-                # Now filter for the requested path
-                prefix = storage_path.rstrip('/') + '/'
-                print(f"Filtering for prefix: {prefix}")
-                
-                for blob in all_blobs:
-                    if blob.name.startswith(prefix):
-                        remaining_path = blob.name[len(prefix):]
-                        
-                        # Skip placeholders and folder markers
-                        if blob.name.endswith('/.placeholder') or blob.name.endswith('/'):
-                            continue
-                        
-                        # Only add files directly in current folder
-                        if '/' not in remaining_path:
-                            file_info = {
-                                'name': blob.name.split('/')[-1],
-                                'full_path': blob.name,
-                                'size': blob.size,
-                                'updated': blob.updated.isoformat() if blob.updated else None,
-                                'content_type': blob.content_type
-                            }
-                            files.append(file_info)
-                            print(f"Added real file: {file_info['name']}")
-                
-                print(f"Successfully listed {len(files)} real files in {storage_path}")
-                
-            except Exception as list_error:
-                import traceback
-                print(f"Firebase listing failed: {list_error}")
-                print(f"Traceback: {traceback.format_exc()}")
-                # Return empty if everything fails
-                print("Could not list any files, returning empty list")
+            prefix = ''
         
-        print(f"Final count: {len(files)} files, {len(folders)} folders")
+        print(f"Using prefix: '{prefix}'")
+        
+        try:
+            # List blobs with delimiter='/' so GCS returns current directory items + subfolder prefixes
+            blob_iterator = bucket.list_blobs(prefix=prefix, delimiter='/')
+            
+            for blob in blob_iterator:
+                # Skip folder markers and internal placeholder files
+                if blob.name == prefix or blob.name.endswith('/') or blob.name.endswith('/.placeholder') or blob.name == '.placeholder':
+                    continue
+                
+                # Relative path from requested prefix
+                relative_path = blob.name[len(prefix):] if prefix else blob.name
+                
+                # File directly under the current folder
+                file_info = {
+                    'name': relative_path,
+                    'full_path': blob.name,
+                    'size': blob.size,
+                    'updated': blob.updated.isoformat() if blob.updated else None,
+                    'content_type': blob.content_type
+                }
+                files.append(file_info)
+            
+            # Subfolders are returned via blob_iterator.prefixes
+            for folder_prefix in blob_iterator.prefixes:
+                # folder_prefix looks like 'previews/' or 'slides/sub/'
+                sub_folder = folder_prefix[len(prefix):].rstrip('/')
+                if sub_folder:
+                    folders.add(sub_folder)
+            
+            # Count files in subfolders
+            folder_counts = {}
+            if folders:
+                from concurrent.futures import ThreadPoolExecutor
+                def count_folder(f_name):
+                    sub_prefix = f"{prefix}{f_name}/"
+                    c = 0
+                    for bl in bucket.list_blobs(prefix=sub_prefix, projection='noAcl', fields='items(name),nextPageToken'):
+                        if not (bl.name.endswith('/') or bl.name.endswith('/.placeholder') or bl.name == '.placeholder'):
+                            c += 1
+                    return f_name, c
+
+                with ThreadPoolExecutor(max_workers=min(len(folders), 10)) as executor:
+                    res = executor.map(count_folder, folders)
+                    folder_counts = dict(res)
+            
+            # In root view, total file count shows sum of files in all folders (+ any root files)
+            if not storage_path:
+                total_file_count = len(files) + sum(folder_counts.values())
+            else:
+                total_file_count = len(files)
+
+            print(f"Successfully listed {len(files)} files and {len(folders)} folders in '{storage_path}'")
+            
+        except Exception as list_error:
+            import traceback
+            print(f"Firebase listing failed: {list_error}")
+            print(f"Traceback: {traceback.format_exc()}")
+            return jsonify({'error': str(list_error)}), 500
+        
+        print(f"Final count: {total_file_count} total files, {len(folders)} folders")
         
         return jsonify({
             'files': files,
             'folders': sorted(list(folders)),
-            'file_count': len(files),
+            'folder_counts': folder_counts,
+            'file_count': total_file_count,
             'folder_count': len(folders),
             'current_path': path
         })
@@ -154,6 +171,26 @@ def list_files():
     except Exception as e:
         import traceback
         print(f"Error listing files: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/folders', methods=['GET'])
+def list_all_folders():
+    """List all unique folder paths across the bucket"""
+    if not bucket:
+        return jsonify({'error': 'Firebase not initialized'}), 500
+        
+    try:
+        blobs = bucket.list_blobs()
+        folders = set()
+        for blob in blobs:
+            parts = blob.name.split('/')
+            for i in range(1, len(parts)):
+                folders.add('/'.join(parts[:i]) + '/')
+        return jsonify({'folders': sorted(list(folders))})
+    except Exception as e:
+        import traceback
+        print(f"Error listing all folders: {e}")
         print(f"Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
@@ -245,6 +282,36 @@ def delete_file():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/copy', methods=['POST'])
+def copy_file():
+    """Copy a single file in Firebase Storage"""
+    if not bucket:
+        return jsonify({'error': 'Firebase not initialized'}), 500
+        
+    try:
+        source_path = request.json.get('source_path')
+        destination_path = request.json.get('destination_path')
+        
+        if not source_path or not destination_path:
+            return jsonify({'error': 'Both source_path and destination_path required'}), 400
+            
+        source_storage_path = get_storage_path(source_path)
+        dest_storage_path = get_storage_path(destination_path)
+        
+        source_blob = bucket.blob(source_storage_path)
+        if not source_blob.exists():
+            return jsonify({'error': 'Source file not found'}), 404
+            
+        bucket.copy_blob(source_blob, bucket, dest_storage_path)
+        
+        return jsonify({
+            'success': True,
+            'source_path': source_storage_path,
+            'destination_path': dest_storage_path
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/move', methods=['POST'])
 def move_file():
     """Move/rename a file in Firebase Storage"""
@@ -261,13 +328,12 @@ def move_file():
         old_storage_path = get_storage_path(old_path)
         new_storage_path = get_storage_path(new_path)
         
-        # Copy to new location
+        # Rename/move blob
         source_blob = bucket.blob(old_storage_path)
-        destination_blob = bucket.blob(new_storage_path)
-        destination_blob.rewrite_from(source_blob)
-        
-        # Delete old file
-        source_blob.delete()
+        if not source_blob.exists():
+            return jsonify({'error': 'Source file not found'}), 404
+            
+        bucket.rename_blob(source_blob, new_storage_path)
         
         return jsonify({
             'success': True,
@@ -325,7 +391,7 @@ def delete_folder():
         storage_path = get_storage_path(path)
         
         # List all blobs in the folder
-        blobs = list(bucket.list_blobs(prefix=storage_path.rstrip('/') + '/', max_results=100))
+        blobs = list(bucket.list_blobs(prefix=storage_path.rstrip('/') + '/'))
         
         # Delete all blobs
         for blob in blobs:
@@ -334,6 +400,125 @@ def delete_folder():
         return jsonify({'success': True, 'path': storage_path})
         
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/batch-delete', methods=['POST'])
+def batch_delete():
+    """Delete multiple files and/or folders"""
+    if not bucket:
+        return jsonify({'error': 'Firebase not initialized'}), 500
+        
+    try:
+        data = request.get_json() or {}
+        files = data.get('files', [])
+        folders = data.get('folders', [])
+        
+        def delete_one_file(file_path):
+            storage_path = get_storage_path(file_path)
+            blob = bucket.blob(storage_path)
+            if blob.exists():
+                blob.delete()
+                return 1
+            return 0
+
+        from concurrent.futures import ThreadPoolExecutor
+        deleted_count = 0
+        
+        if files:
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                results = list(executor.map(delete_one_file, files))
+                deleted_count += sum(results)
+                
+        # Delete folders and their contents
+        for folder_path in folders:
+            storage_path = get_storage_path(folder_path)
+            prefix = storage_path.rstrip('/') + '/'
+            blobs = list(bucket.list_blobs(prefix=prefix))
+            for blob in blobs:
+                blob.delete()
+                deleted_count += 1
+                
+        return jsonify({'success': True, 'deleted_count': deleted_count})
+    except Exception as e:
+        import traceback
+        print(f"Batch delete error: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/batch-copy', methods=['POST'])
+def batch_copy():
+    """Copy multiple files to a destination folder"""
+    if not bucket:
+        return jsonify({'error': 'Firebase not initialized'}), 500
+        
+    try:
+        data = request.get_json() or {}
+        files = data.get('files', [])
+        destination_folder = data.get('destination', '').strip()
+        
+        dest_storage_path = get_storage_path(destination_folder)
+        
+        def copy_one(file_path):
+            source_storage_path = get_storage_path(file_path)
+            source_blob = bucket.blob(source_storage_path)
+            if not source_blob.exists():
+                return 0
+            file_name = source_storage_path.split('/')[-1]
+            if dest_storage_path:
+                target_path = f"{dest_storage_path.rstrip('/')}/{file_name}"
+            else:
+                target_path = file_name
+            bucket.copy_blob(source_blob, bucket, target_path)
+            return 1
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results = list(executor.map(copy_one, files))
+            
+        copied_count = sum(results)
+        return jsonify({'success': True, 'copied_count': copied_count})
+    except Exception as e:
+        import traceback
+        print(f"Batch copy error: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/batch-move', methods=['POST'])
+def batch_move():
+    """Move multiple files to a destination folder"""
+    if not bucket:
+        return jsonify({'error': 'Firebase not initialized'}), 500
+        
+    try:
+        data = request.get_json() or {}
+        files = data.get('files', [])
+        destination_folder = data.get('destination', '').strip()
+        
+        dest_storage_path = get_storage_path(destination_folder)
+        
+        def move_one(file_path):
+            source_storage_path = get_storage_path(file_path)
+            source_blob = bucket.blob(source_storage_path)
+            if not source_blob.exists():
+                return 0
+            file_name = source_storage_path.split('/')[-1]
+            if dest_storage_path:
+                target_path = f"{dest_storage_path.rstrip('/')}/{file_name}"
+            else:
+                target_path = file_name
+            bucket.rename_blob(source_blob, target_path)
+            return 1
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results = list(executor.map(move_one, files))
+            
+        moved_count = sum(results)
+        return jsonify({'success': True, 'moved_count': moved_count})
+    except Exception as e:
+        import traceback
+        print(f"Batch move error: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':

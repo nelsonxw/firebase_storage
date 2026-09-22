@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 1. Place your `serviceAccountKey.json` file in the project directory
 2. The server will automatically use this file for authentication
-3. Update the `STORAGE_BUCKET` variable in `server.py` if needed (default: `slide-preview.appspot.com`)
+3. Update the `STORAGE_BUCKET` variable in `server.py` if needed (default: `slide-preview.firebasestorage.app`)
 
 ### 4. Start the Backend Server
 
